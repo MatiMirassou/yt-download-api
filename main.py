@@ -1,13 +1,16 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel
-from pytubefix import YouTube
 import tempfile
 import os
 import base64
 import logging
+import subprocess
+import json
 
 app = FastAPI()
 logging.basicConfig(level=logging.INFO)
+
+API_KEY = os.environ.get("API_KEY", "")
 
 
 class DownloadRequest(BaseModel):
@@ -23,49 +26,73 @@ class DownloadResponse(BaseModel):
     duration_seconds: int
 
 
+def verify_key(x_api_key: str = Header(None)):
+    if not API_KEY or x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+
+
 @app.get("/")
 async def root():
     return {"status": "ok", "service": "yt-download-api"}
 
 
 @app.post("/download")
-async def download_video(request: DownloadRequest):
+async def download_video(request: DownloadRequest, x_api_key: str = Header(...)):
+    verify_key(x_api_key)
     try:
         logging.info(f"Downloading: {request.url}")
-        yt = YouTube(request.url)
-
-        if request.audio_only:
-            stream = yt.streams.filter(only_audio=True).order_by("abr").desc().first()
-        else:
-            stream = (
-                yt.streams.filter(progressive=True, file_extension="mp4")
-                .order_by("resolution")
-                .desc()
-                .first()
-            )
-
-        if not stream:
-            raise HTTPException(status_code=400, detail="No suitable stream found")
 
         with tempfile.TemporaryDirectory() as tmp_dir:
-            path = stream.download(output_path=tmp_dir)
-            file_size = os.path.getsize(path) / (1024 * 1024)
-
+            output_template = os.path.join(tmp_dir, "%(id)s.%(ext)s")
+            
+            # Build yt-dlp command
+            cmd = [
+                "yt-dlp",
+                "--no-playlist",
+                "-o", output_template,
+                "--print-json",
+            ]
+            
+            if request.audio_only:
+                cmd.extend(["-x", "--audio-format", "mp3"])
+            else:
+                cmd.extend(["-f", "best[height<=720][ext=mp4]/best[height<=720]/best"])
+            
+            cmd.append(request.url)
+            
+            # Run yt-dlp
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            
+            if result.returncode != 0:
+                logging.error(f"yt-dlp error: {result.stderr}")
+                raise HTTPException(status_code=500, detail=f"Download failed: {result.stderr}")
+            
+            # Parse video info from JSON output
+            video_info = json.loads(result.stdout)
+            
+            # Find the downloaded file
+            files = os.listdir(tmp_dir)
+            if not files:
+                raise HTTPException(status_code=500, detail="No file downloaded")
+            
+            filepath = os.path.join(tmp_dir, files[0])
+            file_size = os.path.getsize(filepath) / (1024 * 1024)
+            
             if file_size > 50:
                 raise HTTPException(
                     status_code=400,
-                    detail=f"File too large ({file_size:.1f}MB). Max 50MB for base64 response.",
+                    detail=f"File too large ({file_size:.1f}MB). Max 50MB.",
                 )
-
-            with open(path, "rb") as f:
+            
+            with open(filepath, "rb") as f:
                 file_base64 = base64.b64encode(f.read()).decode()
-
+            
             return DownloadResponse(
-                filename=os.path.basename(path),
+                filename=files[0],
                 file_base64=file_base64,
                 size_mb=round(file_size, 2),
-                title=yt.title,
-                duration_seconds=yt.length,
+                title=video_info.get("title", "Unknown"),
+                duration_seconds=video_info.get("duration", 0),
             )
 
     except HTTPException:
@@ -76,19 +103,25 @@ async def download_video(request: DownloadRequest):
 
 
 @app.get("/info")
-async def get_info(url: str):
-    """Get video metadata without downloading"""
+async def get_info(url: str, x_api_key: str = Header(...)):
+    verify_key(x_api_key)
     try:
-        yt = YouTube(url)
-        streams = yt.streams.filter(progressive=True, file_extension="mp4")
-
+        cmd = ["yt-dlp", "--dump-json", "--no-playlist", url]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        
+        if result.returncode != 0:
+            raise HTTPException(status_code=500, detail=f"Failed to get info: {result.stderr}")
+        
+        info = json.loads(result.stdout)
+        
         return {
-            "title": yt.title,
-            "duration_seconds": yt.length,
-            "author": yt.author,
-            "views": yt.views,
-            "thumbnail_url": yt.thumbnail_url,
-            "available_resolutions": [s.resolution for s in streams],
+            "title": info.get("title"),
+            "duration_seconds": info.get("duration"),
+            "author": info.get("uploader"),
+            "views": info.get("view_count"),
+            "thumbnail_url": info.get("thumbnail"),
         }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
