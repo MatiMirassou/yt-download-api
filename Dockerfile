@@ -2,11 +2,14 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install ffmpeg (needed by yt-dlp for some formats)
+# Install ffmpeg and yt-dlp system dependencies
 RUN apt-get update && apt-get install -y ffmpeg && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+
+# Ensure yt-dlp is in PATH
+ENV PATH="/usr/local/bin:$PATH"
 
 COPY main.py .
 
